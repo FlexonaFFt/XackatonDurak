@@ -1,199 +1,223 @@
 import pandas as pd
+import numpy as np
 from datasets import load_dataset
-from utils.preprocessing import encode_card
 from utils.constants import STATE_MAP
 from collections import defaultdict
 import torch
+import json 
 
-def load_and_preprocess_data(dataset_name="neuronetties/durak", sample_size=None):
-    dataset = load_dataset(dataset_name)
-    print(f"Всего игр в датасете: {len(dataset['train'])}")
-    
-    df = pd.DataFrame(dataset['train'])
-    if sample_size:
-        df = df.sample(sample_size)
-    
-    processed_data = []
-    for _, row in df.iterrows():
-        try:
-            current_player = row['players'][0]
-            opponent = row['players'][1]
-            
-            sample = {
-                'game_id': row['game_id'],
-                'trump': encode_card(row['trump']),
-                'player_state': STATE_MAP[current_player['state']],
-                'hand': [encode_card(card) for card in current_player['hand']],
-                'opponent_hand_size': len(opponent['hand']),
-                'deck_size': len(row['deck']),
-                'table_cards': process_table_cards(row['table']),
-                'timestamp': row['timestamp'],
-                'winner': row['winner']
-            }
-            
-            sample.update(extract_labels(row, current_player))
-            processed_data.append(sample)
-            
-        except Exception as e:
-            print(f"Ошибка обработки игры {row['game_id']}: {str(e)}")
-    
-    return pd.DataFrame(processed_data)
-
-def process_table_cards(table):
-    """Обработка карт на столе"""
-    table_cards = []
-    for item in table:
-        table_cards.append(encode_card(item['attack_card']['card']))
-        if 'defend_card' in item:
-            table_cards.append(encode_card(item['defend_card']['card']))
-    return table_cards
-
-def extract_labels(game_data, player):
-    """Извлечение меток для обучения"""
-    labels = {
-        'value_target': 1.0 if player['id'] == game_data['winner'] else -1.0,
-        'policy_target': 0  # Заглушка - реальные метки нужно определить по логике игры
-    }
-    
-    # Здесь должна быть ваша логика определения правильного действия
-    # Например, анализ следующего состояния игры
-    
-    return labels
-
-def create_dataloader(df, batch_size=32):
-    """Создание DataLoader для обучения"""
-    class DurakDataset(torch.utils.data.Dataset):
-        def __init__(self, data):
-            self.data = data
-            
-        def __len__(self):
-            return len(self.data)
-            
-        def __getitem__(self, idx):
-            sample = self.data.iloc[idx]
-            
-            # Подготовка входных тензоров
-            hand_tensor = torch.zeros(6)  # MAX_HAND_SIZE
-            hand_tensor[:len(sample['hand'])] = torch.tensor(sample['hand'])
-            
-            table_tensor = torch.zeros(12)  # MAX_TABLE_SIZE
-            table_tensor[:len(sample['table_cards'])] = torch.tensor(sample['table_cards'])
-            
-            return {
-                'inputs': {
-                    'hand': hand_tensor.long(),
-                    'table': table_tensor.long(),
-                    'trump': torch.tensor([sample['trump']]).long(),
-                    'player_state': torch.tensor([sample['player_state']]).long(),
-                    'deck_size': torch.tensor([sample['deck_size']]).float()
-                },
-                'targets': {
-                    'policy': torch.tensor(sample['policy_target']).long(),
-                    'value': torch.tensor(sample['value_target']).float()
-                }
-            }
-    
-    return torch.utils.data.DataLoader(
-        DurakDataset(df),
-        batch_size=batch_size,
-        shuffle=True
-    )
-
-def process_game_sequences(dataset, player_id="our_bot"):
+def preprocess_dataset(raw_data):
     """
-    Обрабатывает последовательности ходов в играх, извлекая:
-    - признаки состояния игры
-    - метки правильных действий
-    - ценность позиции
+    Основная функция предобработки данных
     
     Args:
-        dataset: Загруженный датасет с играми
-        player_id: ID нашего бота в данных
+        raw_data: список JSON-объектов с данными игр
         
     Returns:
-        List[Dict]: Список готовых примеров для обучения
+        processed_games: словарь с обработанными играми, структурированными по game_id
+        player_stats: статистика по игрокам
     """
-    processed_samples = []
+    # 1. Группировка данных по game_id
+    games_by_id = defaultdict(list)
+    for snapshot in raw_data:
+        games_by_id[snapshot['game_id']].append(snapshot)
     
-    # Группируем снимки по game_id
-    games = defaultdict(list)
-    for item in dataset:
-        snapshot = json.loads(item['snapshot'])
-        games[snapshot['game_id']].append(snapshot)
+    # 2. Сортировка снимков внутри каждой игры по timestamp
+    for game_id in games_by_id:
+        games_by_id[game_id].sort(key=lambda x: x['timestamp'])
     
-    # Обрабатываем каждую игру отдельно
-    for game_id, snapshots in games.items():
-        # Сортируем по timestamp
-        snapshots.sort(key=lambda x: x['timestamp'])
+    processed_games = {}
+    player_stats = defaultdict(lambda: {'wins': 0, 'losses': 0, 'total_moves': 0})
+    
+    # 3. Обработка каждой игры
+    for game_id, snapshots in games_by_id.items():
+        game_data = {
+            'game_type': snapshots[0]['game_rules']['game_type'],
+            'trump': snapshots[0]['trump'],
+            'winner': snapshots[-1]['winner'],
+            'timesteps': [],
+            'initial_deck': snapshots[0]['deck'].copy(),
+            'players': [p['id'] for p in snapshots[0]['players']]
+        }
         
-        # Определяем победителя (только для value target)
-        winner = snapshots[-1]['winner']
-        
-        # Обрабатываем каждый переход состояния
-        for i in range(len(snapshots)-1):
-            current_state = snapshots[i]
-            next_state = snapshots[i+1]
+        # 4. Обработка каждого шага в игре
+        for i, snapshot in enumerate(snapshots):
+            timestep = {
+                'timestamp': snapshot['timestamp'],
+                'deck_size': len(snapshot['deck']),
+                'bat': snapshot['bat'],
+                'table': snapshot['table'],
+                'player_states': {},
+                'valid_moves': {}
+            }
             
-            # Проверяем, что это наш ход
-            current_player = next(p for p in current_state['players'] if p['id'] == player_id)
-            if current_player['state'] in ['wait', 'winner', 'durak']:
-                continue
+            # 5. Обработка состояния каждого игрока
+            for player in snapshot['players']:
+                player_id = player['id']
+                timestep['player_states'][player_id] = {
+                    'state': player['state'],
+                    'hand': player['hand'],
+                    'hand_size': len(player['hand'])
+                }
                 
-            # Извлекаем признаки (без информации о будущем!)
-            features = extract_features(current_state, player_id)
+                # 6. Определение допустимых ходов для каждого игрока
+                if player['state'] == 'attack':
+                    timestep['valid_moves'][player_id] = get_valid_attacks(player, snapshot)
+                elif player['state'] == 'defend':
+                    timestep['valid_moves'][player_id] = get_valid_defenses(player, snapshot)
+                else:
+                    timestep['valid_moves'][player_id] = get_state_actions(player['state'])
             
-            # Извлекаем метку действия
-            action_label = extract_action_label(current_state, next_state, player_id)
+            game_data['timesteps'].append(timestep)
             
-            # Вычисляем ценность позиции
-            value_label = 1.0 if winner == player_id else -1.0
-            
-            processed_samples.append({
-                'features': features,
-                'action_label': action_label,
-                'value_label': value_label,
-                'game_id': game_id,
-                'timestamp': current_state['timestamp']
-            })
+            # 7. Сбор статистики по игрокам
+            if i > 0:  
+                for player in snapshot['players']:
+                    player_stats[player['id']]['total_moves'] += 1
+        
+        # 8. Обновление статистики побед/поражений
+        winner = game_data['winner']
+        for player_id in game_data['players']:
+            if player_id == winner:
+                player_stats[player_id]['wins'] += 1
+            else:
+                player_stats[player_id]['losses'] += 1
+        
+        processed_games[game_id] = game_data
     
-    return processed_samples
+    return processed_games, player_stats
 
-def extract_features(game_state, player_id):
-    """Извлекает признаки из текущего состояния игры"""
-    current_player = next(p for p in game_state['players'] if p['id'] == player_id)
-    opponent = next(p for p in game_state['players'] if p['id'] != player_id)
+def get_valid_attacks(player, snapshot):
+    valid_moves = []
+    hand = player['hand']
+    if not snapshot['table']:
+        return hand
     
-    # Основные признаки
-    features = {
-        'hand': [encode_card(c) for c in current_player['hand']],
-        'opponent_hand_size': len(opponent['hand']),
-        'trump': encode_card(game_state['trump']),
-        'player_state': STATE_MAP[current_player['state']],
-        'deck_size': len(game_state['deck']),
-        'table': process_table_cards(game_state['table']),
-        'game_type': game_state['game_rules']['game_type']
-    }
+    table_ranks = {card['attack_card']['card'][:-1] for card in snapshot['table']}
+    valid_moves = [card for card in hand if card[:-1] in table_ranks]
     
-    # Дополнительные engineered features
-    features['trump_in_hand'] = any(c[-1] == game_state['trump'][-1] for c in current_player['hand'])
-    features['can_transfer'] = can_transfer(current_player, game_state['table'])
-    
-    return features
+    return valid_moves
 
-def extract_action_label(current_state, next_state, player_id):
-    """Определяет какое действие было совершено между состояниями"""
-    current_player = next(p for p in current_state['players'] if p['id'] == player_id)
+def get_valid_defenses(player, snapshot):
+    valid_moves = []
+    hand = player['hand']
+    trump = snapshot['trump'][-1]
     
-    # Анализируем изменения
-    if current_player['state'] == 'attack':
-        # Находим новую карту на столе
-        new_card = find_new_attack(current_state['table'], next_state['table'])
-        return f"attack_{new_card}" if new_card else "bat"
+    for attack in snapshot['table']:
+        if 'defend_card' not in attack:
+            attack_card = attack['attack_card']['card']
+            attack_rank = attack_card[:-1]
+            attack_suit = attack_card[-1]
+            
+            for card in hand:
+                card_suit = card[-1]
+                card_rank = card[:-1]
+                
+                # Если это козырь и атакующая карта не козырь
+                if card_suit == trump and attack_suit != trump:
+                    valid_moves.append((attack_card, card))
+                # Если масть совпадает и достоинство больше
+                elif card_suit == attack_suit and RANKS[card_rank] > RANKS[attack_rank]:
+                    valid_moves.append((attack_card, card))
     
-    elif current_player['state'] == 'defend':
-        if next_state['players'][0]['state'] == 'take':
-            return "take"
-        new_defense = find_new_defense(current_state['table'], next_state['table'])
-        return f"defend_{new_defense}" if new_defense else "take"
+    return valid_moves
+
+def get_state_actions(state):
+    if state in ['bat', 'pass', 'take']:
+        return [state]
+    return []
+
+RANKS = {'9': 0, '10': 1, '11': 2, '12': 3, '13': 4, '14': 5}
+
+
+
+
+
+def prepare_training_data(processed_games):
+    """
+    Подготавливает данные для обучения модели
     
-    return "wait"
+    Args:
+        processed_games: обработанные данные игр
+        
+    Returns:
+        X: признаки для обучения
+        y: целевые переменные
+        metadata: дополнительная информация о примерах
+    """
+    X = []
+    y = []
+    metadata = []
+    
+    for game_id, game in processed_games.items():
+        game_type = game['game_type']
+        trump = game['trump']
+        
+        for i in range(len(game['timesteps']) - 1):
+            current_step = game['timesteps'][i]
+            next_step = game['timesteps'][i + 1]
+            
+            # Для каждого игрока в текущем состоянии
+            for player_id, player_state in current_step['player_states'].items():
+                # Создаем вектор признаков
+                features = create_feature_vector(player_id, current_step, game_type, trump)
+                
+                # Определяем правильный ход (на основе следующего состояния)
+                correct_move = determine_correct_move(player_id, current_step, next_step)
+                
+                if features and correct_move:
+                    X.append(features)
+                    y.append(correct_move)
+                    metadata.append({
+                        'game_id': game_id,
+                        'player_id': player_id,
+                        'timestamp': current_step['timestamp']
+                    })
+    
+    return np.array(X), np.array(y), metadata
+
+def create_feature_vector(player_id, timestep, game_type, trump):
+    """Создает вектор признаков для текущего состояния игрока"""
+    # 1. Информация о руке игрока
+    hand = timestep['player_states'][player_id]['hand']
+    hand_features = encode_hand(hand, trump)
+    
+    # 2. Информация о столе
+    table_features = encode_table(timestep['table'], trump)
+    
+    # 3. Информация о бито
+    bat_features = encode_bat(timestep['bat'], trump)
+    
+    # 4. Информация о колоде
+    deck_features = [timestep['deck_size'] / 24.0]  # Нормализованный размер колоды
+    
+    # 5. Информация о состоянии игрока
+    state = timestep['player_states'][player_id]['state']
+    state_features = encode_state(state)
+    
+    # 6. Информация о типе игры (классическая/переводная)
+    game_type_feature = [game_type]
+    
+    # Объединяем все признаки
+    feature_vector = (
+        hand_features +
+        table_features +
+        bat_features +
+        deck_features +
+        state_features +
+        game_type_feature
+    )
+    
+    return feature_vector
+
+def determine_correct_move(player_id, current_step, next_step):
+    """Определяет правильный ход на основе следующего состояния"""
+    # Здесь должна быть логика определения, какой ход был сделан игроком
+    # между current_step и next_step
+    # Это может быть сложно и требует анализа изменений в состоянии
+    
+    # Упрощенная версия - берем первый возможный ход (нужно доработать)
+    valid_moves = current_step['valid_moves'].get(player_id, [])
+    if valid_moves:
+        return encode_move(valid_moves[0])
+    return None
