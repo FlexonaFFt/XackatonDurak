@@ -1,87 +1,74 @@
-from model import DurakModel
-from utils.preprocessing import DataLoader
-from utils.dataset import Dataset
+import torch
+import sys 
+import os 
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+
 from torch.utils.data import DataLoader
-from torch.utils.data import random_split
+from utils.preprocessing import DurakDataset
+from .model import DurakModel
 from torch.optim import Adam
+import torch.nn.functional as F
 
-import torch 
-import torch.nn as nn
-import torch.optim as optim
-
-def train_model():
-    # Инициализация датасета
-    dataset = DurakDataset('path_to_data')
+def train():
+    # Инициализация
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    dataset = DurakDataset(hf_dataset="neuronetties/durak", split="train")
+    loader = DataLoader(dataset, batch_size=32, shuffle=True)
     
-    # Разделение на train/val
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
-    
-    # Создание DataLoader
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=32)
-    
-    # Инициализация модели
-    input_size = dataset[0][0].shape[0]
     model = DurakModel(
-        input_size=input_size,
-        action_classes=dataset.action_classes,
-        card_classes=dataset.card_classes
-    )
+        input_size=dataset[0]['features'].shape[0],
+        action_classes=len(dataset.action_encoder.classes_),
+        card_classes=len(dataset.card_encoder.classes_)
+    ).to(device)
     
-    # Оптимизатор и функция потерь
     optimizer = Adam(model.parameters(), lr=0.001)
-    action_loss_fn = nn.CrossEntropyLoss()
-    card_loss_fn = nn.CrossEntropyLoss()
     
     # Цикл обучения
     for epoch in range(10):
         model.train()
-        train_loss = 0.0
+        total_loss = 0
         
-        for X, (y_action, y_card) in train_loader:
+        for batch in loader:
+            features = batch['features'].to(device)
+            action_type = batch['action_type'].to(device)
+            action_card = batch['action_card'].to(device)
+            weights = batch['weight'].to(device)
+            is_winner = batch['is_winner'].to(device)
+            
             optimizer.zero_grad()
             
-            action_logits, card_logits = model(X)
+            # Forward pass
+            action_logits, card_logits, win_prob = model(features)
             
-            # Вычисление потерь
-            action_loss = action_loss_fn(action_logits, y_action)
-            card_loss = card_loss_fn(card_logits, y_card)
-            total_loss = action_loss + card_loss
+            # Расчет потерь с учетом весов
+            action_loss = F.cross_entropy(
+                action_logits.squeeze(1), 
+                action_type.squeeze(1),
+                weight=weights
+            )
             
+            card_loss = F.cross_entropy(
+                card_logits.squeeze(1),
+                action_card.squeeze(1),
+                weight=weights
+            )
+            
+            win_loss = F.binary_cross_entropy(
+                win_prob.squeeze(1),
+                is_winner.squeeze(1)
+            )
+            
+            total_loss = action_loss + card_loss + 0.5 * win_loss
             total_loss.backward()
             optimizer.step()
             
-            train_loss += total_loss.item()
+            total_loss += total_loss.item()
         
-        # Валидация
-        model.eval()
-        val_loss = 0.0
-        correct_actions = 0
-        correct_cards = 0
-        total = 0
-        
-        with torch.no_grad():
-            for X, (y_action, y_card) in val_loader:
-                action_logits, card_logits = model(X)
-                
-                action_loss = action_loss_fn(action_logits, y_action)
-                card_loss = card_loss_fn(card_logits, y_card)
-                val_loss += (action_loss + card_loss).item()
-                
-                # Точность предсказаний
-                _, action_preds = torch.max(action_logits, 1)
-                _, card_preds = torch.max(card_logits, 1)
-                
-                correct_actions += (action_preds == y_action).sum().item()
-                correct_cards += (card_preds == y_card).sum().item()
-                total += y_action.size(0)
-        
-        print(f'Epoch {epoch+1}')
-        print(f'Train Loss: {train_loss/len(train_loader):.4f}')
-        print(f'Val Loss: {val_loss/len(val_loader):.4f}')
-        print(f'Action Accuracy: {correct_actions/total:.4f}')
-        print(f'Card Accuracy: {correct_cards/total:.4f}\n')
+        print(f"Epoch {epoch+1}, Loss: {total_loss/len(loader):.4f}")
     
-    return model, dataset.card_encoder, dataset.action_encoder
+    return model
+
+if __name__ == '__main__':
+    print("Train script started!")
+    train()
