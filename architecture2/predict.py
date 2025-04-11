@@ -1,3 +1,5 @@
+import torch 
+
 def predict_move(model, game_state, card_encoder, action_encoder):
     # Преобразование состояния в тензор
     features = torch.FloatTensor(dataset._extract_features(game_state)).unsqueeze(0)

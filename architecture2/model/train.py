@@ -1,5 +1,7 @@
 from model import DurakModel
 from utils.preprocessing import DataLoader
+from utils.dataset import Dataset
+from torch.utils.data import DataLoader
 from torch.utils.data import random_split
 from torch.optim import Adam
 
